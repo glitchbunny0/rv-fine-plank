@@ -29,7 +29,7 @@
     mouse movement is poor ergonomics anyway.
 --]]
 
-local VERSION = "0.1.0"
+local VERSION = "0.2.0"
 local TAG = "[RVFinePlank] "
 
 -- UE4SS ships UEHelpers in ue4ss/Mods/shared/. Degrade gracefully if it is missing.
@@ -49,7 +49,13 @@ local cfg = {
     fine_scale  = 0.15,  -- axis multiplier while fine mode is on (0.15 = ~1/7th speed)
     nudge_yaw   = 0.05,  -- TUNE: per-tap yaw delta
     nudge_pitch = 0.05,  -- TUNE: per-tap pitch delta
-    nudge_fwd   = 0.05,  -- TUNE: per-tap push/pull delta
+    nudge_fwd   = 0.05,  -- TUNE: per-tap push/pull delta (goes through the game's RPC)
+
+    -- Reach: writes LookAtDistanceWhenHoldingItem directly. Much larger range than the
+    -- clamped Fwd axis, but see the warning in reach_adjust() about replication.
+    reach_step  = 5.0,   -- cm per tap
+    reach_min   = 40.0,  -- clamp: closer than this clips into the camera
+    reach_max   = 400.0, -- clamp: further than this and physics/grab gets silly
     verbose     = false, -- log every nudge
 }
 
@@ -60,6 +66,7 @@ local state = {
     pre_id      = nil,
     post_id     = nil,
     nudges      = 0,
+    orig_reach  = nil,   -- captured before our first write, so we can always restore
 }
 
 local function log(fmt, ...)
@@ -182,6 +189,90 @@ local function nudge(dyaw, dpitch, dfwd)
 end
 
 --------------------------------------------------------------------------------
+-- Mechanism 3: reach — the base hold distance
+--
+-- UpdateHoldTransform computes, per tick:
+--     target = CameraLocation + UpVector * A + ForwardVector * B
+-- (GetBaseAimRotation -> GetUpVector/GetForwardVector, two Conv_DoubleToVector
+--  multiplies, two Add_VectorVector, then a swept SetWorldLocationAndRotation)
+--
+-- The Fwd hand-pose axis feeds that forward term but is FClamped to a narrow band.
+-- LookAtDistanceWhenHoldingItem (a plain double at 0x808) is the baseline, so writing
+-- it moves the object much further in or out than the clamped axis allows.
+--
+-- CAVEAT, UNVERIFIED: UpdateHoldTransform is gated on IsLocallyControlled, and unlike
+-- the Fwd axis this write does NOT pass through Server_SetHandPoseInput. It may
+-- therefore be local-only — looking right on your screen while the server still thinks
+-- the plank is at the old distance, which would make nails land wrong. Test item 6 in
+-- docs/TEST-PLAN.md exists specifically to settle this. Prefer the Fwd axis (numpad
+-- +/-) when precision relative to other players matters.
+--------------------------------------------------------------------------------
+
+local function read_reach(char)
+    local ok, v = pcall(function() return char.LookAtDistanceWhenHoldingItem end)
+    if ok and type(v) == "number" then return v end
+    return nil
+end
+
+local function reach_adjust(delta)
+    ExecuteInGameThread(function()
+        local char = get_character()
+        if not char then log("reach ignored: no character"); return end
+
+        local cur = read_reach(char)
+        if not cur then
+            log("reach FAILED: LookAtDistanceWhenHoldingItem unreadable " ..
+                "(property name may differ on this build)")
+            return
+        end
+
+        -- Remember the stock value once, so `rvfine reset` can always undo us.
+        if state.orig_reach == nil then state.orig_reach = cur end
+
+        local want = cur + delta
+        if want < cfg.reach_min then want = cfg.reach_min end
+        if want > cfg.reach_max then want = cfg.reach_max end
+
+        local ok, err = pcall(function() char.LookAtDistanceWhenHoldingItem = want end)
+        if not ok then
+            log("reach write failed: %s", tostring(err)); return
+        end
+
+        local now = read_reach(char)
+        if now and math.abs(now - want) > 0.001 then
+            log("reach write did not stick (wanted %.1f, read %.1f) — property may be " ..
+                "recomputed each tick", want, now)
+            return
+        end
+
+        if cfg.verbose or delta ~= 0 then
+            log("reach %.1f -> %.1f cm  (stock %.1f)", cur, want, state.orig_reach)
+        end
+    end)
+end
+
+local function reach_reset()
+    ExecuteInGameThread(function()
+        local char = get_character()
+        if not char then log("reset ignored: no character"); return end
+        if state.orig_reach == nil then
+            log("reset: reach was never modified, nothing to restore")
+        else
+            local ok = pcall(function() char.LookAtDistanceWhenHoldingItem = state.orig_reach end)
+            log(ok and string.format("reach restored to stock %.1f cm", state.orig_reach)
+                   or "reach restore FAILED")
+        end
+        -- also zero the hand-pose accumulators via the game's own path
+        local holding = select(1, hold_state(char))
+        if holding then
+            local cur_y = 0
+            pcall(function() cur_y = char.HandEmoteYaw end)
+            if cfg.verbose then log("note: hand pose left as-is (yaw %.3f); drop and re-grab to clear", cur_y) end
+        end
+    end)
+end
+
+--------------------------------------------------------------------------------
 -- Diagnostics — the numeric probe channel. This is how we verify behaviour
 -- without trusting feel: read the accumulators and the live hold target.
 --------------------------------------------------------------------------------
@@ -204,7 +295,10 @@ local function probe()
         add("HandEmoteFwd",    function() return char.HandEmoteFwd end)
         add("HandEmoteRight",  function() return char.HandEmoteRight end)
         add("HandEmoteLeft",   function() return char.HandEmoteLeft end)
-        add("LookAtDistance",  function() return char.LookAtDistanceWhenHoldingItem end)
+        add("LookAtDistance",  function() return char.LookAtDistance end)
+        add("Reach(holding)",  function() return char.LookAtDistanceWhenHoldingItem end)
+        out[#out + 1] = string.format("  %-28s %s", "Reach(stock)",
+            state.orig_reach and string.format("%.1f", state.orig_reach) or "<untouched>")
 
         -- FVector / FRotator (3x double each)
         local function vec(label, field)
@@ -268,16 +362,21 @@ local function tally(b) if b then bound = bound + 1 end end
 tally(bind("F3", toggle_fine,                                        "toggle fine mode"))
 tally(bind("F4", probe,                                              "probe values"))
 
--- Numpad: 4/6 yaw, 8/2 pitch, ADD/SUBTRACT push-pull
+-- Numpad: 4/6 yaw, 8/2 pitch, ADD/SUBTRACT push-pull (via the game's replicated axis)
 tally(bind("NUM_FOUR",  function() nudge(-cfg.nudge_yaw, 0, 0) end,  "yaw -"))
 tally(bind("NUM_SIX",   function() nudge( cfg.nudge_yaw, 0, 0) end,  "yaw +"))
 tally(bind("NUM_EIGHT", function() nudge(0,  cfg.nudge_pitch, 0) end,"pitch +"))
 tally(bind("NUM_TWO",   function() nudge(0, -cfg.nudge_pitch, 0) end,"pitch -"))
-tally(bind("ADD",       function() nudge(0, 0,  cfg.nudge_fwd) end,  "push away"))
-tally(bind("SUBTRACT",  function() nudge(0, 0, -cfg.nudge_fwd) end,  "pull closer"))
+tally(bind("ADD",       function() nudge(0, 0,  cfg.nudge_fwd) end,  "push away (fine)"))
+tally(bind("SUBTRACT",  function() nudge(0, 0, -cfg.nudge_fwd) end,  "pull closer (fine)"))
+
+-- Reach: coarse base distance, far more range than the clamped axis above
+tally(bind("NUM_NINE",  function() reach_adjust( cfg.reach_step) end, "reach further"))
+tally(bind("NUM_THREE", function() reach_adjust(-cfg.reach_step) end, "reach closer"))
+tally(bind("NUM_FIVE",  reach_reset,                                  "restore stock reach"))
 
 --------------------------------------------------------------------------------
--- Console commands:  rvfine probe | on | off | scale <f> | step <f> | verbose
+-- Console: rvfine probe|on|off|scale <f>|step <f>|reach <f>|reachstep <f>|reset|verbose|hook
 --------------------------------------------------------------------------------
 
 local function handle_cmd(_, params, out)
@@ -296,6 +395,18 @@ local function handle_cmd(_, params, out)
     elseif sub == "step" and arg then
         cfg.nudge_yaw, cfg.nudge_pitch, cfg.nudge_fwd = arg, arg, arg
         log("nudge step = %.4f on all axes", arg)
+    elseif sub == "reach" and arg then
+        -- absolute target: compute the delta from current
+        ExecuteInGameThread(function()
+            local char = get_character()
+            local cur = char and read_reach(char)
+            if cur then reach_adjust(arg - cur) else log("reach: unreadable") end
+        end)
+    elseif sub == "reachstep" and arg then
+        cfg.reach_step = arg
+        log("reach_step = %.2f cm", arg)
+    elseif sub == "reset" then
+        reach_reset()
     elseif sub == "verbose" then
         cfg.verbose = not cfg.verbose
         log("verbose = %s", tostring(cfg.verbose))
@@ -303,7 +414,7 @@ local function handle_cmd(_, params, out)
         state.hooked = false
         install_hook()
     else
-        log("usage: rvfine [probe|on|off|scale <f>|step <f>|verbose|hook]")
+        log("usage: rvfine [probe|on|off|scale <f>|step <f>|reach <cm>|reachstep <cm>|reset|verbose|hook]")
     end
     return true
 end

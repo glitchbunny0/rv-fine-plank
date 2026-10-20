@@ -7,8 +7,8 @@ genuinely uncertain things (calibration, multiplayer quantization) come before a
 
 - UE4SS v3.0.1-1181+ installed next to `Ride-Win64-Shipping.exe`; `ue4ss/UE4SS.log` exists after launch.
 - On Proton: launch option `WINEDLLOVERRIDES="dwmapi=n,b" %command%`.
-- Confirm the load line appears in the log: `[RVFinePlank] v0.1.0 loaded — 8 keybinds bound.`
-  - If it says fewer than 8, a `Key` name differs in that UE4SS build; the log names which one.
+- Confirm the load line appears in the log: `[RVFinePlank] v0.2.0 loaded — 11 keybinds bound.`
+  - If it says fewer than 11, a `Key` name differs in that UE4SS build; the log names which one.
 
 ## 1. Hook attaches
 
@@ -57,6 +57,22 @@ Line a plank up against a ledge with fine mode, then nail it with the nail gun.
 - The nail must land where the plank visually is.
 - Nailing goes through `Server_TrySpawnNail` server-side, so this is the real test of whether the
   finely-placed transform actually reached the server.
+
+## 5b. Reach — settle whether it replicates (the biggest open question)
+
+Solo first: hold a plank, `rvfine probe` to note `Reach(holding)`, tap numpad `9` five times,
+probe again. The value should have moved by `5 × reach_step` and the plank should visibly sit
+further away.
+
+- If the log says **"write did not stick"**, the property is recomputed each tick and the coarse
+  control is not viable — drop it and rely on the Fwd axis alone.
+- Confirm numpad `5` restores the stock value, and that it survives dropping and re-grabbing.
+
+Then with two clients, because this is the part that cannot be inferred: change reach as a client
+and have the host watch the plank. If the host sees it at the **old** distance, the write is
+local-only — in that case the coarse control must be documented as cosmetic-only and must never be
+used before nailing. Verify by nailing after a reach change and checking where the nail lands on
+the host's screen.
 
 ## 6. Multiplayer (do not skip)
 

@@ -51,7 +51,8 @@ function M.new_character(opts)
         HandEmoteRight = false,
         HandEmoteLeft  = false,
 
-        LookAtDistanceWhenHoldingItem = 150.0,
+        LookAtDistanceWhenHoldingItem = opts.reach or 150.0,
+        LookAtDistance                = 250.0,
 
         -- 3x double each (0xA50 / 0xA68)
         HoldTransformTargetLocation = new_vector(10.5, -3.25, 88.0),
@@ -108,6 +109,7 @@ function M.install(character, opts)
     _G.Key = {
         F3 = 114, F4 = 115,
         NUM_FOUR = 100, NUM_SIX = 102, NUM_EIGHT = 104, NUM_TWO = 98,
+        NUM_NINE = 105, NUM_THREE = 99, NUM_FIVE = 101,
         ADD = 107, SUBTRACT = 109,
     }
     if opts.drop_key then _G.Key[opts.drop_key] = nil end

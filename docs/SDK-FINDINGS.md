@@ -52,11 +52,29 @@ pack into a vector, branch on server/client.
 
 `UpdateHoldTransform` temporaries: `IsLocallyControlled`, `K2_GetComponentLocation/Rotation`,
 `GetBaseAimRotation`, **`RInterpTo`**, **`VInterpTo`**, `BreakTransform`,
-`K2_SetWorldLocationAndRotation` (with `SweepHitResult`), `GetUpVector`, `GetForwardVector`,
-vector multiplies and adds.
+`K2_SetWorldLocationAndRotation` (with `SweepHitResult`), `BreakVector_X/Y/Z`,
+`GetBaseAimRotation_1`, `Conv_DoubleToVector`, `GetUpVector`, `GetForwardVector`,
+`Multiply_VectorVector`, `Conv_DoubleToVector_1`, `Multiply_VectorVector_1`,
+`K2_GetComponentLocation_1`, `Add_VectorVector`, `Add_VectorVector_1`.
 
-→ per tick, target = camera location + forward×a + up×b; smoothed with VInterpTo/RInterpTo;
-committed with a swept SetWorldLocationAndRotation; only for the locally controlled pawn.
+Read in offset order that is an unambiguous construction:
+
+```
+target = CameraLocation
+       + UpVector      * A      -- Conv_DoubleToVector  -> Multiply_VectorVector
+       + ForwardVector * B      -- Conv_DoubleToVector_1 -> Multiply_VectorVector_1
+```
+
+where `A` and `B` are doubles pulled out by `BreakVector_X/Y/Z` — i.e. components of the
+hand-pose vector that `HandleHandPoseInput` assembles with `MakeVector`. The result is smoothed
+by `VInterpTo`/`RInterpTo` and committed with a swept `SetWorldLocationAndRotation`, only for the
+locally controlled pawn.
+
+**Consequence for distance control:** the *Fwd* hand-pose axis is the along-view distance term, so
+pushing and pulling the held object is the same code path as rotating it — and it inherits the
+`FClamp` from `HandleHandPoseInput`, which bounds how far it can travel.
+`LookAtDistanceWhenHoldingItem` (`0x808`, double, sits directly after `LookAtDistance` at `0x800`)
+is the separate baseline with no such clamp.
 
 ### Planks are not a dedicated class
 
@@ -83,9 +101,17 @@ with `AddNail` / `CanBeNailed` / `RemoveNail` implemented across many actors.
    dump. This is why `nudge_*` needs in-game calibration.
 3. **Whether hand-pose input is gated on `IsHandPosing`.** The mod logs a note but still calls
    through, letting the game decide.
-4. **Whether the server quantizes the replicated pose.** Would look smooth locally and steppy to
+4. **Whether writing `LookAtDistanceWhenHoldingItem` replicates.** It does not pass through
+   `Server_SetHandPoseInput`, and `UpdateHoldTransform` is `IsLocallyControlled`-gated, so the
+   coarse reach control may be local-only. If so, a nail placed after a reach change lands where
+   the *server* thinks the plank is. This is the single most important thing to test.
+5. **Whether the server quantizes the replicated pose.** Would look smooth locally and steppy to
    other players. Only a two-client test shows this.
-5. **The `/Game/` asset path of `BP_FirstPersonCharacter`.** Not recoverable from the dump, hence
+6. **Mouse wheel is probably not hold distance.** `IA_MouseWheel` has exactly one handler on the
+   character and its body lives in the ubergraph, so it is not readable from the dump — but the
+   character also owns `Radial_Wheel_AC` with `On_Active_Slot_Changed` / `On_Selection_Changed`,
+   which suggests the wheel drives item selection rather than distance.
+7. **The `/Game/` asset path of `BP_FirstPersonCharacter`.** Not recoverable from the dump, hence
    runtime path discovery.
 
 ## Caveat on offsets

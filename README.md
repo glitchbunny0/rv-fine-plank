@@ -11,9 +11,34 @@ in two ways, and deliberately does **not** reimplement any of the game's own log
 | `F4` | Probe — dump live hold values to the UE4SS console |
 | Numpad `4` / `6` | Yaw the held object by one step |
 | Numpad `8` / `2` | Pitch the held object by one step |
-| Numpad `+` / `-` | Push away / pull closer by one step |
+| Numpad `+` / `-` | Push away / pull closer, **fine** (replicated) |
+| Numpad `9` / `3` | Reach further / closer, **coarse** (see caveat) |
+| Numpad `5` | Restore stock reach |
 
-Console: `rvfine [probe|on|off|scale <f>|step <f>|verbose|hook]`
+Console: `rvfine [probe|on|off|scale <f>|step <f>|reach <cm>|reachstep <cm>|reset|verbose|hook]`
+
+## Moving the object closer and further
+
+There are two separate distance mechanisms, and the difference matters.
+
+**Fine, and properly networked — numpad `+` / `-`.** `UpdateHoldTransform` computes the hold
+target each tick as `CameraLocation + UpVector*A + ForwardVector*B`, and the hand-pose *Fwd* axis
+feeds that forward term. Driving it through `HandleHandPoseInput` means the value travels over the
+game's own `Server_SetHandPoseInput` RPC, so everyone in the session sees the same plank position.
+The game `FClamp`s this axis, so its range is limited — it is for precision, not for reaching
+across a ravine.
+
+**Coarse, with a caveat — numpad `9` / `3`.** `LookAtDistanceWhenHoldingItem` is the baseline
+distance, a plain double on the character. Writing it moves the object much further in or out than
+the clamped axis allows. But `UpdateHoldTransform` is gated on `IsLocallyControlled` and this write
+does *not* pass through the server RPC, so **it may be local-only** — correct on your screen while
+the server still has the plank at the old distance, which would make nails land in the wrong place.
+This is unverified; test item 6 in `docs/TEST-PLAN.md` exists to settle it. Until then, prefer the
+fine axis when precision relative to other players matters.
+
+Reach writes are clamped to 40–400 cm, the stock value is captured before the first write, and
+numpad `5` (or `rvfine reset`) always restores it — so a stuck key cannot leave your hold distance
+permanently wrong.
 
 ## How it works
 

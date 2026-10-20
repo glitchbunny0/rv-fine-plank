@@ -56,7 +56,7 @@ do
 
     local n = 0
     for _ in pairs(mock.registry.keybinds) do n = n + 1 end
-    check("all 8 keybinds registered", n == 8, "got " .. n)
+    check("all 11 keybinds registered", n == 11, "got " .. n)
     check("console command 'rvfine' registered", mock.registry.commands["rvfine"] ~= nil)
     check("retry loop installed", #mock.registry.loops >= 1)
     check("spawn notify installed", mock.registry.notifies["/Script/Engine.PlayerController"] ~= nil)
@@ -186,7 +186,7 @@ do
     check("still loads with an unknown key", ok)
     local n = 0
     for _ in pairs(mock.registry.keybinds) do n = n + 1 end
-    check("binds the remaining 7", n == 7, "got " .. n)
+    check("binds the remaining 10", n == 10, "got " .. n)
     local warned = false
     for _, line in ipairs(mock.registry.output) do
         if line:find("WARN key 'ADD'", 1, true) then warned = true end
@@ -242,6 +242,99 @@ do
     check("probe read the vector components", blob:find("X=10.500", 1, true) ~= nil)
     check("probe read the rotator components", blob:find("Y=90.000", 1, true) ~= nil)
     check("probe did not hit unreadable fields", blob:find("<unreadable>", 1, true) == nil, blob)
+end
+
+-- ---------------------------------------------------------------------------
+print("\n[10] reach — coarse hold distance, with a safe restore")
+do
+    local char = mock.new_character({ reach = 150.0 })
+    load_mod(char, { with_uehelpers = true })
+
+    -- further / closer
+    capture(function() mock.registry.keybinds[_G.Key.NUM_NINE]() end)
+    check("NUM_NINE pushes reach out by reach_step", near(char.LookAtDistanceWhenHoldingItem, 155.0),
+          char.LookAtDistanceWhenHoldingItem)
+    capture(function()
+        mock.registry.keybinds[_G.Key.NUM_THREE]()
+        mock.registry.keybinds[_G.Key.NUM_THREE]()
+    end)
+    check("NUM_THREE pulls reach in", near(char.LookAtDistanceWhenHoldingItem, 145.0),
+          char.LookAtDistanceWhenHoldingItem)
+
+    -- restore must return exactly the stock value, not an accumulated guess
+    capture(function() mock.registry.keybinds[_G.Key.NUM_FIVE]() end)
+    check("NUM_FIVE restores the stock reach exactly", near(char.LookAtDistanceWhenHoldingItem, 150.0),
+          char.LookAtDistanceWhenHoldingItem)
+end
+
+print("\n[11] reach clamps, so a held key cannot wreck the hold")
+do
+    local char = mock.new_character({ reach = 150.0 })
+    load_mod(char, { with_uehelpers = true })
+    capture(function()
+        for _ = 1, 200 do mock.registry.keybinds[_G.Key.NUM_NINE]() end
+    end)
+    check("clamped at reach_max", near(char.LookAtDistanceWhenHoldingItem, 400.0),
+          char.LookAtDistanceWhenHoldingItem)
+    capture(function()
+        for _ = 1, 400 do mock.registry.keybinds[_G.Key.NUM_THREE]() end
+    end)
+    check("clamped at reach_min", near(char.LookAtDistanceWhenHoldingItem, 40.0),
+          char.LookAtDistanceWhenHoldingItem)
+    -- and the original is still recoverable after all that
+    capture(function() mock.registry.keybinds[_G.Key.NUM_FIVE]() end)
+    check("stock value survived the clamping", near(char.LookAtDistanceWhenHoldingItem, 150.0),
+          char.LookAtDistanceWhenHoldingItem)
+end
+
+print("\n[12] reach console surface + absolute targeting")
+do
+    local char = mock.new_character({ reach = 150.0 })
+    load_mod(char, { with_uehelpers = true })
+    local cmd = mock.registry.commands["rvfine"]
+
+    capture(function() cmd("rvfine reach 220", { "reach", "220" }, nil) end)
+    check("`reach <cm>` sets an absolute distance", near(char.LookAtDistanceWhenHoldingItem, 220.0),
+          char.LookAtDistanceWhenHoldingItem)
+
+    capture(function() cmd("rvfine reachstep 25", { "reachstep", "25" }, nil) end)
+    capture(function() mock.registry.keybinds[_G.Key.NUM_NINE]() end)
+    check("`reachstep` changes the per-tap amount", near(char.LookAtDistanceWhenHoldingItem, 245.0),
+          char.LookAtDistanceWhenHoldingItem)
+
+    capture(function() cmd("rvfine reset", { "reset" }, nil) end)
+    check("`reset` restores stock", near(char.LookAtDistanceWhenHoldingItem, 150.0),
+          char.LookAtDistanceWhenHoldingItem)
+
+    -- reset with nothing to undo must not error or invent a value
+    local char2 = mock.new_character({ reach = 180.0 })
+    load_mod(char2, { with_uehelpers = true })
+    local blob = capture(function()
+        mock.registry.commands["rvfine"]("rvfine reset", { "reset" }, nil)
+    end)
+    check("reset is a no-op when untouched", near(char2.LookAtDistanceWhenHoldingItem, 180.0))
+    check("reset says so", blob:find("never modified", 1, true) ~= nil)
+end
+
+print("\n[13] reach failure modes are reported, not swallowed")
+do
+    -- property missing entirely (e.g. renamed in a game patch)
+    local char = mock.new_character()
+    char.LookAtDistanceWhenHoldingItem = nil
+    load_mod(char, { with_uehelpers = true })
+    local blob = capture(function() mock.registry.keybinds[_G.Key.NUM_NINE]() end)
+    check("unreadable property is reported", blob:find("unreadable", 1, true) ~= nil, blob)
+
+    -- property that refuses to hold a written value (recomputed each tick)
+    local char2 = mock.new_character({ reach = 150.0 })
+    load_mod(char2, { with_uehelpers = true })
+    setmetatable(char2, {
+        __index = function(_, k) return k == "LookAtDistanceWhenHoldingItem" and 150.0 or nil end,
+        __newindex = function() end,  -- swallow writes
+    })
+    char2.LookAtDistanceWhenHoldingItem = nil   -- force reads through the metatable
+    local blob2 = capture(function() mock.registry.keybinds[_G.Key.NUM_NINE]() end)
+    check("a write that does not stick is detected", blob2:find("did not stick", 1, true) ~= nil, blob2)
 end
 
 -- ---------------------------------------------------------------------------
