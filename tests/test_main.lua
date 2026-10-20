@@ -79,7 +79,7 @@ do
     else
         local n = 0
         for _ in pairs(reg().keybinds) do n = n + 1 end
-        check("all 16 keybinds registered", n == 16, "got " .. n)
+        check("all 17 keybinds registered", n == 17, "got " .. n)
         check("console command registered", reg().commands["rvfine"] ~= nil)
         check("hook retry loop installed", #reg().loops >= 1)
         check("feedback loop installed", #reg().loops >= 2, #reg().loops)
@@ -464,7 +464,7 @@ do
     local mod3 = load_mod(char3, { drop_key = "HOME" })
     local n = 0
     for _ in pairs(reg().keybinds) do n = n + 1 end
-    check("one unknown key costs exactly one binding", n == 15, "got " .. n)
+    check("one unknown key costs exactly one binding", n == 16, "got " .. n)
     local warned = false
     for _, l in ipairs(reg().output) do
         if l:find("key 'HOME'", 1, true) then warned = true end
@@ -490,6 +490,92 @@ do
     check("no unreadable fields", blob:find("<unreadable>", 1, true) == nil)
 end
 
+real_print("\n[16] FREEZE: park the plank in world space")
+do
+    local actor = mock.new_actor({ loc = { X = 100, Y = 200, Z = 300 },
+                                   rot = { Pitch = 0, Yaw = 45, Roll = 0 } })
+    local char = mock.new_character({ actor = actor })
+    local mod = load_mod(char)
+    local freeze = require("rvfp_freeze")
+
+    check("post-hook installed on UpdateHoldTransform",
+          reg().hooks["/Game/Blueprints/Character/BP_FirstPersonCharacter.BP_FirstPersonCharacter_C:UpdateHoldTransform"] ~= nil,
+          next(reg().hooks))
+    check("freeze reports the hook", freeze.state.post_hooked == true)
+
+    capture(function() press("freeze") end)
+    check("frozen flag set", freeze.state.frozen == true)
+    check("captured the location", freeze.state.loc and near(freeze.state.loc.X, 100))
+    check("captured the rotation", freeze.state.rot and near(freeze.state.rot.Yaw, 45))
+
+    -- simulate the game moving the plank, then the post-hook firing
+    local moved = 0
+    actor.K2_SetActorLocationAndRotation = function(_, loc, rot) moved = moved + 1 end
+    local post = reg().hooks[
+        "/Game/Blueprints/Character/BP_FirstPersonCharacter.BP_FirstPersonCharacter_C:UpdateHoldTransform"].post
+    capture(function() post() end)
+    check("post-hook rewrote the transform", moved == 1, moved)
+    check("reapply counter advanced", freeze.state.reapplies == 1, freeze.state.reapplies)
+
+    -- toggling off stops the rewriting
+    capture(function() press("freeze") end)
+    check("unfrozen", freeze.state.frozen == false)
+    capture(function() post() end)
+    check("no rewrite once unfrozen", moved == 1, moved)
+end
+
+real_print("\n[16b] freeze releases itself rather than teleporting the wrong object")
+do
+    local actor = mock.new_actor()
+    local char = mock.new_character({ actor = actor })
+    load_mod(char)
+    local freeze = require("rvfp_freeze")
+    capture(function() press("freeze") end)
+    check("frozen", freeze.state.frozen == true)
+
+    -- player drops it and picks up something else
+    local other = mock.new_actor({ name = "BP_Interactable_Actor_C /Game/Other.Other:Plank_02" })
+    capture(function() freeze.hold_still(other) end)
+    check("freeze released on object change", freeze.state.frozen == false)
+    check("reason recorded", tostring(freeze.state.last_error):find("changed", 1, true) ~= nil,
+          freeze.state.last_error)
+end
+
+real_print("\n[16c] freeze degrades when the transform cannot be written")
+do
+    local actor = mock.new_actor()
+    actor.K2_SetActorLocationAndRotation = function() error("refused") end
+    local char = mock.new_character({ actor = actor })
+    load_mod(char)
+    local freeze = require("rvfp_freeze")
+    capture(function() press("freeze") end)
+    local ok = pcall(function() capture(function() freeze.hold_still(actor) end) end)
+    check("does not throw", ok)
+    check("releases itself", freeze.state.frozen == false)
+    check("reports why", tostring(freeze.state.last_error):find("write failed", 1, true) ~= nil,
+          freeze.state.last_error)
+end
+
+real_print("\n[16d] freeze refuses with empty hands, and shows in the HUD")
+do
+    local char = mock.new_character({ holding = false })
+    load_mod(char)
+    local freeze = require("rvfp_freeze")
+    capture(function() press("freeze") end)
+    check("not frozen with empty hands", freeze.state.frozen == false)
+    check("told the player",
+          (reg().screen_by_key["rvfp_toast"] or ""):find("nothing in hand", 1, true) ~= nil)
+
+    local char2 = mock.new_character()
+    load_mod(char2)
+    capture(function() press("freeze") end)
+    mock.pump_loops()
+    check("HUD shows FROZEN",
+          (reg().screen_by_key["rvfp_hud"] or ""):find("FROZEN", 1, true) ~= nil,
+          reg().screen_by_key["rvfp_hud"])
+end
+
+-- ---------------------------------------------------------------------------
 real_print(string.format("\n=== %d passed, %d failed ===", passed, failed))
 if failed > 0 then real_print("failures: " .. table.concat(failures, ", ")); os.exit(1) end
 os.exit(0)

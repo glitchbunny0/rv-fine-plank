@@ -24,7 +24,7 @@
     See docs/SDK-FINDINGS.md for the reverse-engineering evidence.
 --]]
 
-local VERSION = "0.3.0"
+local VERSION = "0.4.0"
 local TAG = "[RVFinePlank] "
 
 -- ------------------------------------------------------------- module loading
@@ -50,13 +50,14 @@ local function need(name)
     return nil
 end
 
-local cfg   = need("rvfp_config")
-local mathx = need("rvfp_math")
-local ue    = need("rvfp_ue")
-local hold  = need("rvfp_hold")
-local hud   = need("rvfp_hud")
+local cfg    = need("rvfp_config")
+local mathx  = need("rvfp_math")
+local ue     = need("rvfp_ue")
+local hold   = need("rvfp_hold")
+local hud    = need("rvfp_hud")
+local freeze = need("rvfp_freeze")
 
-if not (cfg and mathx and ue and hold and hud) then
+if not (cfg and mathx and ue and hold and hud and freeze) then
     print(TAG .. "aborting: module load failed\n")
     return
 end
@@ -120,6 +121,20 @@ local function install_hook()
     end
     state.hooked, state.hook_path = true, path
     log("hooked %s", path)
+
+    -- Freeze mode needs a post-hook on UpdateHoldTransform, on the same class.
+    -- Derive the class path by stripping the function name off what we resolved.
+    local class_path = path:match("^(.*):[^:]+$")
+    local fok, ferr = freeze.install_post_hook(class_path, function()
+        local c = ue.get_character()
+        return c and ue.held_actor(c) or nil
+    end)
+    if fok then
+        log("freeze post-hook installed")
+    else
+        log("freeze post-hook unavailable (%s) — falling back to a fast timer",
+            tostring(ferr))
+    end
     return true
 end
 
@@ -197,6 +212,27 @@ local function act_recalibrate()
     end)
 end
 
+local function act_freeze_toggle()
+    ExecuteInGameThread(function()
+        local char = ue.get_character()
+        if not char then return end
+        if freeze.state.frozen then
+            freeze.unfreeze()
+            toast("unfrozen — the game has the plank again")
+            return
+        end
+        local holding = hold.hold_flags(char)
+        if not holding then toast("nothing in hand to freeze") return end
+        local actor = ue.held_actor(char)
+        local ok, err = freeze.freeze(actor)
+        if ok then
+            toast("FROZEN — move around and look; press again to release")
+        else
+            toast("freeze failed: %s", tostring(err))
+        end
+    end)
+end
+
 local function act_probe()
     ExecuteInGameThread(function()
         local char = ue.get_character()
@@ -220,6 +256,10 @@ local function act_probe()
             line("off level (deg)", string.format("%.2f", mathx.off_level(xf.rot.Pitch, xf.rot.Roll)))
         end
         line("can print to screen", can_print); line("can draw in world", can_draw)
+        line("frozen", freeze.state.frozen)
+        line("freeze post-hook", freeze.state.post_hooked)
+        line("freeze reapplies", freeze.state.reapplies)
+        line("freeze last error", freeze.state.last_error)
         line("mod", string.format("fine=%s snap=%s hud=%s guides=%s hooked=%s actions=%d",
             tostring(state.fine), tostring(state.snap), tostring(state.hud),
             tostring(state.guides), tostring(state.hooked), hold.state.actions))
@@ -271,10 +311,11 @@ tally(bind("snap_toggle", function()
     toast("snap %s", state.snap and string.format("ON (%.0f deg)", cfg.snap_deg) or "off")
 end, "snap"))
 
-tally(bind("probe",       act_probe,       "probe"))
-tally(bind("recalibrate", act_recalibrate, "recalibrate"))
-tally(bind("zero_pose",   act_zero,        "zero pose"))
-tally(bind("reset_all",   act_reset,       "reset"))
+tally(bind("probe",       act_probe,          "probe"))
+tally(bind("recalibrate", act_recalibrate,    "recalibrate"))
+tally(bind("zero_pose",   act_zero,           "zero pose"))
+tally(bind("freeze",      act_freeze_toggle,  "freeze"))
+tally(bind("reset_all",   act_reset,          "reset"))
 
 tally(bind("yaw_minus",  function() act_nudge(-cfg.nudge_deg, 0, 0) end, "yaw -"))
 tally(bind("yaw_plus",   function() act_nudge( cfg.nudge_deg, 0, 0) end, "yaw +"))
@@ -303,6 +344,7 @@ local function handle_cmd(_, params)
         state.snap = true; toast("snap ON (%.0f deg)", cfg.snap_deg)
     elseif sub == "nosnap" then state.snap = false; toast("snap off")
     elseif sub == "zero"   then act_zero()
+    elseif sub == "freeze" then act_freeze_toggle()
     elseif sub == "level"  then act_snap_now()
     elseif sub == "hud"    then state.hud = not state.hud; hud.clear_warnings(); toast("HUD %s", tostring(state.hud))
     elseif sub == "guides" then state.guides = not state.guides; hud.clear_warnings(); toast("guides %s", tostring(state.guides))
@@ -346,6 +388,7 @@ local function feedback_tick()
             hud.show({
                 holding = holding, posing = posing,
                 fine = state.fine, snap = state.snap,
+                frozen = freeze.state.frozen,
                 yaw = yaw, pitch = pitch, fwd = fwd,
                 reach = hold.reach(char), orig_reach = hold.state.orig_reach,
                 off_level = off,
@@ -378,6 +421,20 @@ pcall(function()
     LoopAsync(math.max(33, math.floor((cfg.hud_interval or 0.1) * 1000)), function()
         feedback_tick()
         return false   -- run forever
+    end)
+end)
+
+-- Freeze fallback. Only does anything while frozen AND the post-hook is absent;
+-- when the hook is in place it is already re-applying every tick, more smoothly.
+pcall(function()
+    LoopAsync(math.max(8, math.floor((cfg.freeze_fallback_interval or 0.016) * 1000)), function()
+        if freeze.state.frozen and not freeze.state.post_hooked then
+            ExecuteInGameThread(function()
+                local c = ue.get_character()
+                freeze.hold_still(c and ue.held_actor(c) or nil)
+            end)
+        end
+        return false
     end)
 end)
 

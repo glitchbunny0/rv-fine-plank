@@ -41,6 +41,10 @@ return {
     calibrate       = true,
     calibrate_probe = 0.05,  -- probe delta used for the measurement
 
+    -- Freeze fallback: if the UpdateHoldTransform post-hook cannot be installed,
+    -- re-apply the frozen transform on this interval instead (seconds).
+    freeze_fallback_interval = 0.016,
+
     -- ---------------------------------------------------------------- keymap
     keys = {
         fine_toggle  = "F3",          -- scale mouse input down
@@ -62,6 +66,7 @@ return {
 
         snap_toggle  = "HOME",
         zero_pose    = "END",         -- return the pose to neutral
+        freeze       = "F9",          -- park the plank in world space and look around
         reset_all    = "F8",          -- restore stock reach + clear state
     },
 }

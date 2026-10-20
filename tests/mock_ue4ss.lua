@@ -145,6 +145,7 @@ end
 -- be tested. A build missing a name is simulated with opts.drop_key.
 local KEYS = {
     F1=112, F2=113, F3=114, F4=115, F5=116, F6=117, F7=118, F8=119,
+    F9=120, F10=121, F11=122, F12=123,
     LEFT=37, RIGHT=39, UP=38, DOWN=40,
     PAGE_UP=33, PAGE_DOWN=34, HOME=36, END=35, INSERT=45, DELETE=46,
     NUM_FOUR=100, NUM_SIX=102, NUM_EIGHT=104, NUM_TWO=98,

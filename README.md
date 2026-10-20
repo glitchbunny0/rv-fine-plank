@@ -21,6 +21,7 @@ in two ways, and deliberately does **not** reimplement any of the game's own log
 | `Ins` / `Del` | Reach further / closer, **coarse** (see caveat) |
 | `Home` | Toggle snapping to a degree grid |
 | `End` | Return the pose to neutral |
+| `F9` | **Freeze** — park the plank in world space and look around |
 
 Every key is rebindable in `RVFinePlank/Scripts/rvfp_config.lua`. Nothing is on the numpad:
 your right hand is on the mouse and your left on WASD, and plenty of keyboards have no numpad.
@@ -72,6 +73,25 @@ calibration has run. A separate short-lived line confirms each action.
 - **plumb lines** from each end, to check the ends are over the ledges and not over the gap.
 
 Both self-disable if the engine APIs are unreachable, rather than erroring every frame.
+
+## Freeze (`F9`) — the one that fixes cause #1
+
+Press `F9` while holding a plank and it stops following your camera: it stays exactly where it
+was in world space, so you can walk sideways, crouch, and look along the ledge to check whether
+it is genuinely seated. Press again to hand it back to the game.
+
+Implemented as a **post-hook** on `UpdateHoldTransform`: the game's own logic runs completely
+untouched and the frozen transform is simply written afterwards, so there is no interpolation to
+fight. If that hook cannot be installed the mod falls back to a fast timer, which is less smooth
+but still works — `rvfine probe` reports which path is active.
+
+It releases itself rather than misbehaving: if the held object changes, or a transform write is
+refused, freeze turns off and says why.
+
+**This is a local inspection aid.** `UpdateHoldTransform` is `IsLocallyControlled`-gated and the
+write goes through no RPC, so other players still see the plank following your camera while it is
+frozen. Nothing persists — unfreeze and the game resumes control — but **unfreeze before nailing**,
+so the server agrees about where the plank is.
 
 ## Moving the object closer and further
 
@@ -153,13 +173,12 @@ Calibrate in-game: hold a plank, press `F4` to read `HandEmoteYaw`, tap Numpad `
 
 ## Status
 
-Logic is covered by two off-game suites (`./tools/run_tests.sh` — **146 assertions**: 51 pure-maths
-and 95 integration against a mocked UE4SS, both run in CI). **Nothing has been verified in the
+Logic is covered by two off-game suites (`./tools/run_tests.sh` — **164 assertions**: 51 pure-maths
+and 113 integration against a mocked UE4SS, both run in CI). **Nothing has been verified in the
 running game yet**; see `docs/TEST-PLAN.md` for what must be confirmed and `docs/SDK-FINDINGS.md`
 for which facts are reverse-engineering certainty versus inference.
 
-Still to come: freeze/park (decouple the plank from the camera) and a ghost placement preview
-built on the game's own `BP_PrevisActorComponent`.
+Still to come: a ghost placement preview built on the game's own `BP_PrevisActorComponent`.
 
 ## Layout
 
@@ -171,6 +190,7 @@ RVFinePlank/Scripts/
   rvfp_ue.lua       every engine call, each one guarded
   rvfp_hold.lua     calibration, nudging, snapping, zeroing, reach
   rvfp_hud.lua      the readout and the world guides
+  rvfp_freeze.lua   parking the plank in world space
 ```
 
 `main.lua` puts its own directory on `package.path` before requiring, with a `dofile` fallback,

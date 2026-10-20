@@ -191,6 +191,17 @@ function M.trace_down(from, distance)
     return hit
 end
 
+-- Write an actor's world transform. Used by freeze mode to hold a plank still
+-- after the game's own UpdateHoldTransform has moved it.
+-- bSweep=false, bTeleport=true: we want an exact placement, not a swept move
+-- that could be blocked by the geometry we are trying to line up against.
+function M.set_actor_transform(actor, loc, rot)
+    if not actor or not loc or not rot then return false end
+    return pcall(function()
+        actor:K2_SetActorLocationAndRotation(loc, rot, false, true)
+    end) and true or false
+end
+
 M.color = {
     white  = WHITE,
     green  = { R = 0.25, G = 1.00, B = 0.35, A = 1.0 },
