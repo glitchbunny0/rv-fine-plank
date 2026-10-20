@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lua:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua 5.4
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
+
+      - name: Syntax check
+        run: luac5.4 -p RVFinePlank/Scripts/main.lua tests/mock_ue4ss.lua tests/test_main.lua
+
+      - name: Test suite
+        run: lua5.4 tests/test_main.lua
+
+      - name: Installer smoke test
+        run: |
+          set -euo pipefail
+          FAKE="$RUNNER_TEMP/fakegame/Ride"
+          mkdir -p "$FAKE/Ride/Binaries/Win64"
+          touch "$FAKE/Ride/Binaries/Win64/Ride-Win64-Shipping.exe" \
+                "$FAKE/Ride/Binaries/Win64/dwmapi.dll"
+          ./tools/install.sh "$FAKE"
+          test -f "$FAKE/Ride/Binaries/Win64/ue4ss/Mods/RVFinePlank/Scripts/main.lua"
+          test -f "$FAKE/Ride/Binaries/Win64/ue4ss/Mods/RVFinePlank/enabled.txt"
+          # must fail cleanly on a bad path
+          if ./tools/install.sh /nonexistent >/dev/null 2>&1; then
+            echo "expected non-zero exit for a missing game dir"; exit 1
+          fi
+          echo "installer OK"
