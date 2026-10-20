@@ -1,5 +1,7 @@
 # RVFinePlank
 
+[![tests](https://github.com/glitchbunny0/rv-fine-plank/actions/workflows/test.yml/badge.svg)](https://github.com/glitchbunny0/rv-fine-plank/actions/workflows/test.yml)
+
 Fine adjustment of held objects (planks especially) for **RV There Yet?** — a UE4SS Lua mod.
 
 The game already has held-object manipulation; it is just coarse. This mod makes it precise
@@ -97,10 +99,20 @@ Calibrate in-game: hold a plank, press `F4` to read `HandEmoteYaw`, tap Numpad `
 
 ## Status
 
-Logic is covered by an off-game test suite (`lua tests/test_main.lua` — 49 assertions against a
-mocked UE4SS and a fake character). **Nothing has been verified in the running game yet**; see
-`docs/TEST-PLAN.md` for what must be confirmed and `docs/SDK-FINDINGS.md` for which facts are
-reverse-engineered certainty versus inference.
+Logic is covered by an off-game test suite (`./tools/run_tests.sh` — 62 assertions against a
+mocked UE4SS and a fake character, run in CI). **Nothing has been verified in the running game
+yet**; see `docs/TEST-PLAN.md` for what must be confirmed and `docs/SDK-FINDINGS.md` for which
+facts are reverse-engineering certainty versus inference.
+
+## Legal
+
+This repository contains no game code, assets, or binaries. The interface names and offsets in
+`docs/SDK-FINDINGS.md` were recovered from a community-published Dumper-7 dump and are recorded
+only as far as needed to call the game's own functions — which is what interoperability
+reverse engineering is for (EU Software Directive 2009/24/EC Art. 6; §69e UrhG in Germany).
+
+The mod changes nothing for other players beyond what the game's own replicated RPC already
+carries, and is not a cheat: it makes an existing mechanic finer, nothing more.
 
 ## Licence
 
