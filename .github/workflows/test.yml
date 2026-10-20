@@ -16,9 +16,12 @@ jobs:
         run: sudo apt-get update -qq && sudo apt-get install -y -qq lua5.4
 
       - name: Syntax check
-        run: luac5.4 -p RVFinePlank/Scripts/main.lua tests/mock_ue4ss.lua tests/test_main.lua
+        run: luac5.4 -p RVFinePlank/Scripts/*.lua tests/*.lua
 
-      - name: Test suite
+      - name: Maths suite
+        run: lua5.4 tests/test_math.lua
+
+      - name: Integration suite
         run: lua5.4 tests/test_main.lua
 
       - name: Installer smoke test

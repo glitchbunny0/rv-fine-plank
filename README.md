@@ -10,14 +10,68 @@ in two ways, and deliberately does **not** reimplement any of the game's own log
 | Key | Action |
 |---|---|
 | `F3` | Toggle fine mode (scales hand-pose input to 15%) |
-| `F4` | Probe — dump live hold values to the UE4SS console |
-| Numpad `4` / `6` | Yaw the held object by one step |
-| Numpad `8` / `2` | Pitch the held object by one step |
-| Numpad `+` / `-` | Push away / pull closer, **fine** (replicated) |
-| Numpad `9` / `3` | Reach further / closer, **coarse** (see caveat) |
-| Numpad `5` | Restore stock reach |
+| `F4` | Toggle the on-screen readout |
+| `F5` | Toggle the world alignment guides |
+| `F6` | Probe — dump everything to the UE4SS console |
+| `F7` | Re-measure the input sensitivity |
+| `F8` | Reset (restore stock reach, clear state) |
+| `←` / `→` | Yaw by one step (degrees) |
+| `↑` / `↓` | Pitch by one step (degrees) |
+| `PgUp` / `PgDn` | Push away / pull closer, **fine** (replicated) |
+| `Ins` / `Del` | Reach further / closer, **coarse** (see caveat) |
+| `Home` | Toggle snapping to a degree grid |
+| `End` | Return the pose to neutral |
 
-Console: `rvfine [probe|on|off|scale <f>|step <f>|reach <cm>|reachstep <cm>|reset|verbose|hook]`
+Every key is rebindable in `RVFinePlank/Scripts/rvfp_config.lua`. Nothing is on the numpad:
+your right hand is on the mouse and your left on WASD, and plenty of keyboards have no numpad.
+
+Console: `rvfine [probe|on|off|scale f|deg f|cm f|snap [f]|nosnap|zero|level|hud|guides|reach cm|reachstep cm|calibrate|reset|verbose|hook]`
+
+## What actually makes placement hard
+
+Worth stating, because it shaped the design. The game holds objects at
+`target = CameraLocation + Up×A + Forward×B`, smoothed with `VInterpTo`/`RInterpTo`. So:
+
+1. **The object is welded to your view.** Moving it moves your view *of* it — you can never hold
+   it still and inspect the alignment from somewhere else.
+2. **It always lags toward its target**, so what you see is not where it will come to rest.
+3. **You have no numbers.**
+
+Smaller increments barely touch any of that. This mod therefore leads with **information** (the
+readout and the guides), **structure** (snapping, levelling) and **real units** (runtime
+calibration), and treats fine mode as the last-millimetre tool it actually is.
+
+## Real degrees, measured at runtime
+
+The game multiplies hand-pose input by a sensitivity constant that is not recoverable from a
+static dump, so early versions had opaque step sizes. The mod now **measures it**: it applies a
+known probe, observes how far the accumulator moved, and undoes the probe. If the pose happens to
+be pinned against the game's clamp it re-probes in the other direction.
+
+After that, `nudge_deg = 1.0` really means one degree, snapping to 15° is meaningful, and the
+readout shows true values. `F7` re-measures; the HUD says `UNCALIBRATED` if it has not run.
+
+Large moves iterate, because the game clamps how much a *single* call may contribute — zeroing a
+pose from 45° in one call would silently under-shoot.
+
+## Feedback: readout and guides
+
+**On-screen readout** (`F4`) uses `PrintString` with a stable key, so it refreshes in place
+instead of scrolling. It shows the live yaw/pitch/push offsets, the plank's **tilt in degrees**
+(green under 1.5°, amber above), the current reach against its stock value, and whether
+calibration has run. A separate short-lived line confirms each action.
+
+**World guides** (`F5`) draw with the `DrawDebug` family:
+
+- an **oriented footprint box** at the plank's real rotation and extent, so you see the volume
+  rather than guessing;
+- the plank's **long axis projected** out to where it points — the thing you actually need when
+  bridging a gap;
+- a **level reference line** along the same heading with zero pitch. The visible gap between that
+  and the axis line *is* your tilt error;
+- **plumb lines** from each end, to check the ends are over the ledges and not over the gap.
+
+Both self-disable if the engine APIs are unreachable, rather than erroring every frame.
 
 ## Moving the object closer and further
 
@@ -99,10 +153,28 @@ Calibrate in-game: hold a plank, press `F4` to read `HandEmoteYaw`, tap Numpad `
 
 ## Status
 
-Logic is covered by an off-game test suite (`./tools/run_tests.sh` — 62 assertions against a
-mocked UE4SS and a fake character, run in CI). **Nothing has been verified in the running game
-yet**; see `docs/TEST-PLAN.md` for what must be confirmed and `docs/SDK-FINDINGS.md` for which
-facts are reverse-engineering certainty versus inference.
+Logic is covered by two off-game suites (`./tools/run_tests.sh` — **146 assertions**: 51 pure-maths
+and 95 integration against a mocked UE4SS, both run in CI). **Nothing has been verified in the
+running game yet**; see `docs/TEST-PLAN.md` for what must be confirmed and `docs/SDK-FINDINGS.md`
+for which facts are reverse-engineering certainty versus inference.
+
+Still to come: freeze/park (decouple the plank from the camera) and a ghost placement preview
+built on the game's own `BP_PrevisActorComponent`.
+
+## Layout
+
+```
+RVFinePlank/Scripts/
+  main.lua          wiring: keybinds, console, feedback loop, boot
+  rvfp_config.lua   all tuning and the keymap — the only file you need to edit
+  rvfp_math.lua     pure maths (snapping, calibration arithmetic, geometry)
+  rvfp_ue.lua       every engine call, each one guarded
+  rvfp_hold.lua     calibration, nudging, snapping, zeroing, reach
+  rvfp_hud.lua      the readout and the world guides
+```
+
+`main.lua` puts its own directory on `package.path` before requiring, with a `dofile` fallback,
+because UE4SS's own path setup varies between builds.
 
 ## Legal
 

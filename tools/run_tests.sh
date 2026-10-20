@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 LUA="$(command -v lua || command -v lua5.4 || true)"
+LUAC="$(command -v luac || command -v luac5.4 || true)"
+
 if [[ -z "$LUA" ]]; then
     CACHE="${TMPDIR:-/tmp}/lua-5.4.7"
     if [[ ! -x "$CACHE/src/lua" ]]; then
@@ -13,8 +15,21 @@ if [[ -z "$LUA" ]]; then
         make -s -C "$CACHE" linux
     fi
     LUA="$CACHE/src/lua"
+    LUAC="$CACHE/src/luac"
 fi
 
 echo "lua: $LUA"
 "$LUA" -v
+
+echo
+echo "--- syntax ---"
+"$LUAC" -p RVFinePlank/Scripts/*.lua tests/*.lua
+echo "ok"
+
+echo
+echo "--- maths ---"
+"$LUA" tests/test_math.lua
+
+echo
+echo "--- integration ---"
 exec "$LUA" tests/test_main.lua

@@ -1,72 +1,76 @@
---[[
-    RVFinePlank — fine adjustment of held objects for "RV There Yet?" (UE 5.6)
-    UE4SS Lua mod. Target build: UE4SS v3.0.1-1181+ (first release with UE 5.6 support).
+--[[ RVFinePlank — precise placement of held objects in "RV There Yet?" (UE 5.6)
 
-    DESIGN (see docs/SDK-FINDINGS.md for the reverse-engineering evidence)
+    UE4SS Lua mod. Target: UE4SS v3.0.1-1181+ (first build with UE 5.6 support).
 
-    The game already implements held-object manipulation. On BP_FirstPersonCharacter_C:
+    WHY THIS EXISTS, AND WHAT ACTUALLY MAKES PLACEMENT HARD
 
-        HandleHandPoseInput(Yaw, Pitch, Fwd)   -- 3 doubles in; internally multiplies each by a
-                                                  sensitivity constant, FClamps it, accumulates into
-                                                  HandEmoteYaw/Pitch/Fwd, clamps those, branches on
-                                                  IsServer, and pushes via Server_SetHandPoseInput.
-        UpdateHoldTransform(DeltaSeconds)      -- per tick: builds a target from camera fwd/up,
-                                                  smooths with VInterpTo/RInterpTo, commits with
-                                                  SetWorldLocationAndRotation (swept).
+    The game holds objects at  target = CameraLocation + Up*A + Forward*B, smoothed
+    with VInterpTo/RInterpTo. Three consequences drive this mod's design:
 
-    So we never reimplement anything. Two mechanisms, both routed through the game's own
-    HandleHandPoseInput so that clamping, the server RPC and replication all still run exactly
-    as the developers wrote them (this is what keeps co-op correct):
+      1. The object is welded to your view. Moving it moves your view OF it, so you
+         can never hold it still and inspect the alignment from elsewhere.
+      2. The object always lags toward its target, so what you see is not where it
+         will come to rest.
+      3. You have no numbers — only vibes.
 
-      1. FINE MODE (toggle) — hook HandleHandPoseInput and scale the incoming axes down.
-         Mouse/stick movement then moves the plank proportionally less. Smooth, analogue.
+    Smaller increments barely touch any of that, which is why this mod leads with
+    information (HUD, world guides), structure (snapping, levelling) and real units
+    (runtime calibration), and treats fine mode as the last-millimetre tool it is.
 
-      2. NUDGE KEYS — call HandleHandPoseInput ourselves with a small fixed delta.
-         Deterministic, repeatable steps for lining a plank up against a specific edge.
+    Everything that changes the object goes through the game's own
+    HandleHandPoseInput, so clamping, the Server_SetHandPoseInput RPC and
+    replication all still run as shipped — which is what keeps co-op correct.
 
-    Fine mode is a TOGGLE, not a held modifier, because UE4SS Lua has no reliable
-    "is this key currently down" query — and holding a modifier while making a precise
-    mouse movement is poor ergonomics anyway.
+    See docs/SDK-FINDINGS.md for the reverse-engineering evidence.
 --]]
 
-local VERSION = "0.2.0"
+local VERSION = "0.3.0"
 local TAG = "[RVFinePlank] "
 
--- UE4SS ships UEHelpers in ue4ss/Mods/shared/. Degrade gracefully if it is missing.
-local UEHelpers = nil
+-- ------------------------------------------------------------- module loading
+-- Put this script's own directory on package.path first, so that both this file
+-- and the modules it loads can use plain require(). UE4SS's package.path setup
+-- varies between builds, so we do not rely on it.
 do
-    local ok, mod = pcall(require, "UEHelpers")
-    if ok then UEHelpers = mod end
+    local src = debug.getinfo(1, "S").source
+    local dir = src and src:match("^@(.*[/\\])") or nil
+    if dir then package.path = dir .. "?.lua;" .. package.path end
 end
 
---------------------------------------------------------------------------------
--- Config.  Values marked TUNE are in *input units*, not degrees/cm: the game
--- multiplies them by its own sensitivity constant before accumulating, and that
--- constant is not readable from a static dump.  Calibrate on first run with the
--- `rvfine probe` console command, which prints the resulting HandEmote* values.
---------------------------------------------------------------------------------
-local cfg = {
-    fine_scale  = 0.15,  -- axis multiplier while fine mode is on (0.15 = ~1/7th speed)
-    nudge_yaw   = 0.05,  -- TUNE: per-tap yaw delta
-    nudge_pitch = 0.05,  -- TUNE: per-tap pitch delta
-    nudge_fwd   = 0.05,  -- TUNE: per-tap push/pull delta (goes through the game's RPC)
+local function need(name)
+    local ok, mod = pcall(require, name)
+    if ok and type(mod) == "table" then return mod end
+    -- fallback: load straight off disk next to this script
+    local src = debug.getinfo(1, "S").source
+    local dir = src and src:match("^@(.*[/\\])") or ""
+    local ok2, mod2 = pcall(dofile, dir .. name .. ".lua")
+    if ok2 and type(mod2) == "table" then return mod2 end
+    print(TAG .. "FATAL: cannot load module '" .. name .. "' (" ..
+          tostring(mod) .. " / " .. tostring(mod2) .. ")\n")
+    return nil
+end
 
-    -- Reach: writes LookAtDistanceWhenHoldingItem directly. Much larger range than the
-    -- clamped Fwd axis, but see the warning in reach_adjust() about replication.
-    reach_step  = 5.0,   -- cm per tap
-    reach_min   = 40.0,  -- clamp: closer than this clips into the camera
-    reach_max   = 400.0, -- clamp: further than this and physics/grab gets silly
-    verbose     = false, -- log every nudge
-}
+local cfg   = need("rvfp_config")
+local mathx = need("rvfp_math")
+local ue    = need("rvfp_ue")
+local hold  = need("rvfp_hold")
+local hud   = need("rvfp_hud")
+
+if not (cfg and mathx and ue and hold and hud) then
+    print(TAG .. "aborting: module load failed\n")
+    return
+end
+
+-- --------------------------------------------------------------------- state
 
 local state = {
-    fine        = false,
-    hooked      = false,
-    hook_path   = nil,
-    pre_id      = nil,
-    post_id     = nil,
-    nudges      = 0,
-    orig_reach  = nil,   -- captured before our first write, so we can always restore
+    fine      = false,
+    snap      = cfg.snap_enabled and true or false,
+    hud       = cfg.hud and true or false,
+    guides    = cfg.guides and true or false,
+    hooked    = false,
+    hook_path = nil,
+    bound     = 0,
 }
 
 local function log(fmt, ...)
@@ -74,372 +78,319 @@ local function log(fmt, ...)
     print(TAG .. (ok and s or tostring(fmt)) .. "\n")
 end
 
---------------------------------------------------------------------------------
--- Player lookup
---------------------------------------------------------------------------------
-
-local function get_character()
-    local c = nil
-    if UEHelpers and UEHelpers.GetPlayer then
-        local ok, res = pcall(UEHelpers.GetPlayer)
-        if ok then c = res end
-    end
-    if not c or not c:IsValid() then
-        local ok, res = pcall(FindFirstOf, "BP_FirstPersonCharacter_C")
-        if ok then c = res end
-    end
-    if c and c:IsValid() then return c end
-    return nil
+-- Short-lived on-screen confirmation, on a different PrintString key from the
+-- persistent HUD so the two do not fight over the same slot.
+local function toast(fmt, ...)
+    local ok, s = pcall(string.format, fmt, ...)
+    local msg = ok and s or tostring(fmt)
+    ue.print_screen("RVFinePlank: " .. msg, 1.6, "rvfp_toast", ue.color.amber)
+    if cfg.verbose then log("%s", msg) end
 end
 
--- Is the player actually holding something and in hand-pose mode?
--- Both are plain bools on the character (IsHolding 0xB68, IsHandPosing 0xB69).
-local function hold_state(char)
-    local holding, posing = false, false
-    pcall(function() holding = char.IsHolding and true or false end)
-    pcall(function() posing  = char.IsHandPosing and true or false end)
-    return holding, posing
-end
+-- ------------------------------------------------------------- fine-mode hook
 
---------------------------------------------------------------------------------
--- Mechanism 1: fine mode — scale the real input down inside the game's own handler
---------------------------------------------------------------------------------
-
--- Derive the Blueprint function path at runtime. We cannot hardcode it: the asset
--- path inside /Game/ is not recoverable from the SDK dump, only the class name is.
 local function resolve_hook_path()
-    local char = get_character()
-    if not char then return nil, "no character instance yet" end
-
+    local char = ue.get_character()
+    if not char then return nil, "no character yet" end
     local cls = char:GetClass()
-    if not cls or not cls:IsValid() then return nil, "character has no class" end
-
-    -- GetFullName() -> "BlueprintGeneratedClass /Game/Some/Path/BP_X.BP_X_C"
+    if not cls then return nil, "no class" end
     local full = cls:GetFullName()
-    if type(full) ~= "string" then return nil, "GetFullName returned non-string" end
-
-    local obj_path = full:match("^%S+%s+(.+)$") or full
-    return obj_path .. ":HandleHandPoseInput", nil
+    if type(full) ~= "string" then return nil, "GetFullName not a string" end
+    return (full:match("^%S+%s+(.+)$") or full) .. ":HandleHandPoseInput", nil
 end
 
 local function install_hook()
     if state.hooked then return true end
-
     local path, err = resolve_hook_path()
     if not path then
-        log("hook deferred: %s", err or "unknown")
+        if cfg.verbose then log("hook deferred: %s", err) end
         return false
     end
-
-    local ok, a, b = pcall(RegisterHook, path,
-        function(self, Yaw, Pitch, Fwd)
-            if not state.fine then return end
-            -- Pre-hook params are RemoteUnrealParam wrappers: :get() / :set().
-            -- Scaling here means the clamp + accumulate + Server_SetHandPoseInput
-            -- chain downstream is untouched.
-            local okk = pcall(function()
-                Yaw:set(Yaw:get()     * cfg.fine_scale)
-                Pitch:set(Pitch:get() * cfg.fine_scale)
-                Fwd:set(Fwd:get()     * cfg.fine_scale)
-            end)
-            if not okk and cfg.verbose then log("warn: could not scale axes this call") end
+    local ok, a = pcall(RegisterHook, path, function(_, Yaw, Pitch, Fwd)
+        if not state.fine then return end
+        pcall(function()
+            Yaw:set(Yaw:get()     * cfg.fine_scale)
+            Pitch:set(Pitch:get() * cfg.fine_scale)
+            Fwd:set(Fwd:get()     * cfg.fine_scale)
         end)
-
+    end)
     if not ok then
         log("RegisterHook FAILED on %s (%s)", path, tostring(a))
         return false
     end
-
-    state.hooked, state.hook_path, state.pre_id, state.post_id = true, path, a, b
+    state.hooked, state.hook_path = true, path
     log("hooked %s", path)
     return true
 end
 
---------------------------------------------------------------------------------
--- Mechanism 2: nudge — drive the game's handler with an exact small delta
---------------------------------------------------------------------------------
+-- ------------------------------------------------------------------- actions
+-- Every action runs on the game thread and refuses politely when nothing is held.
 
-local function nudge(dyaw, dpitch, dfwd)
+local function with_char(what, fn)
     ExecuteInGameThread(function()
-        local char = get_character()
-        if not char then log("nudge ignored: no character"); return end
-
-        local holding, posing = hold_state(char)
-        if not holding then
-            if cfg.verbose then log("nudge ignored: not holding anything") end
-            return
-        end
-        if not posing and cfg.verbose then
-            log("note: IsHandPosing is false — the game may ignore pose input outside hand mode")
-        end
-
-        local ok, err = pcall(function()
-            char:HandleHandPoseInput(dyaw, dpitch, dfwd)
-        end)
-        if not ok then
-            log("HandleHandPoseInput call failed: %s", tostring(err))
-            return
-        end
-
-        state.nudges = state.nudges + 1
-        if cfg.verbose then
-            log("nudge #%d  dYaw=%.4f dPitch=%.4f dFwd=%.4f", state.nudges, dyaw, dpitch, dfwd)
-        end
+        local char = ue.get_character()
+        if not char then if cfg.verbose then log("%s: no character", what) end return end
+        local holding = hold.hold_flags(char)
+        if not holding then toast("nothing in hand") return end
+        fn(char)
     end)
 end
 
---------------------------------------------------------------------------------
--- Mechanism 3: reach — the base hold distance
---
--- UpdateHoldTransform computes, per tick:
---     target = CameraLocation + UpVector * A + ForwardVector * B
--- (GetBaseAimRotation -> GetUpVector/GetForwardVector, two Conv_DoubleToVector
---  multiplies, two Add_VectorVector, then a swept SetWorldLocationAndRotation)
---
--- The Fwd hand-pose axis feeds that forward term but is FClamped to a narrow band.
--- LookAtDistanceWhenHoldingItem (a plain double at 0x808) is the baseline, so writing
--- it moves the object much further in or out than the clamped axis allows.
---
--- CAVEAT, UNVERIFIED: UpdateHoldTransform is gated on IsLocallyControlled, and unlike
--- the Fwd axis this write does NOT pass through Server_SetHandPoseInput. It may
--- therefore be local-only — looking right on your screen while the server still thinks
--- the plank is at the old distance, which would make nails land wrong. Test item 6 in
--- docs/TEST-PLAN.md exists specifically to settle this. Prefer the Fwd axis (numpad
--- +/-) when precision relative to other players matters.
---------------------------------------------------------------------------------
-
-local function read_reach(char)
-    local ok, v = pcall(function() return char.LookAtDistanceWhenHoldingItem end)
-    if ok and type(v) == "number" then return v end
-    return nil
+local function ensure_calibrated(char)
+    if hold.state.calibrated or not cfg.calibrate then return end
+    local s, note = hold.calibrate(char, cfg.calibrate_probe)
+    if s then log("calibrated: %s", note) else log("calibration failed: %s", note) end
 end
 
-local function reach_adjust(delta)
-    ExecuteInGameThread(function()
-        local char = get_character()
-        if not char then log("reach ignored: no character"); return end
-
-        local cur = read_reach(char)
-        if not cur then
-            log("reach FAILED: LookAtDistanceWhenHoldingItem unreadable " ..
-                "(property name may differ on this build)")
-            return
-        end
-
-        -- Remember the stock value once, so `rvfine reset` can always undo us.
-        if state.orig_reach == nil then state.orig_reach = cur end
-
-        local want = cur + delta
-        if want < cfg.reach_min then want = cfg.reach_min end
-        if want > cfg.reach_max then want = cfg.reach_max end
-
-        local ok, err = pcall(function() char.LookAtDistanceWhenHoldingItem = want end)
-        if not ok then
-            log("reach write failed: %s", tostring(err)); return
-        end
-
-        local now = read_reach(char)
-        if now and math.abs(now - want) > 0.001 then
-            log("reach write did not stick (wanted %.1f, read %.1f) — property may be " ..
-                "recomputed each tick", want, now)
-            return
-        end
-
-        if cfg.verbose or delta ~= 0 then
-            log("reach %.1f -> %.1f cm  (stock %.1f)", cur, want, state.orig_reach)
-        end
+local function act_nudge(dyaw, dpitch, dfwd)
+    with_char("nudge", function(char)
+        ensure_calibrated(char)
+        hold.apply(char, dyaw, dpitch, dfwd)
+        if state.snap then hold.snap(char, cfg.snap_deg) end
     end)
 end
 
-local function reach_reset()
-    ExecuteInGameThread(function()
-        local char = get_character()
-        if not char then log("reset ignored: no character"); return end
-        if state.orig_reach == nil then
-            log("reset: reach was never modified, nothing to restore")
-        else
-            local ok = pcall(function() char.LookAtDistanceWhenHoldingItem = state.orig_reach end)
-            log(ok and string.format("reach restored to stock %.1f cm", state.orig_reach)
-                   or "reach restore FAILED")
-        end
-        -- also zero the hand-pose accumulators via the game's own path
-        local holding = select(1, hold_state(char))
-        if holding then
-            local cur_y = 0
-            pcall(function() cur_y = char.HandEmoteYaw end)
-            if cfg.verbose then log("note: hand pose left as-is (yaw %.3f); drop and re-grab to clear", cur_y) end
-        end
+local function act_snap_now()
+    with_char("snap", function(char)
+        ensure_calibrated(char)
+        local dy, dp = hold.snap(char, cfg.snap_deg)
+        if dy == nil then toast("snap: pose unreadable")
+        elseif dy == 0 and dp == 0 then toast("already on %.0f deg grid", cfg.snap_deg)
+        else toast("snapped %+.2f / %+.2f deg", dy, dp) end
     end)
 end
 
---------------------------------------------------------------------------------
--- Diagnostics — the numeric probe channel. This is how we verify behaviour
--- without trusting feel: read the accumulators and the live hold target.
---------------------------------------------------------------------------------
+local function act_zero()
+    with_char("zero", function(char)
+        ensure_calibrated(char)
+        local ok = hold.zero_pose(char)
+        toast(ok and "pose returned to neutral" or "could not zero pose")
+    end)
+end
 
-local function probe()
+local function act_reach(delta)
+    with_char("reach", function(char)
+        local v, err = hold.reach_adjust(char, delta, cfg)
+        if err then toast("reach: %s", err) else toast("reach %.0f cm", v) end
+    end)
+end
+
+local function act_reset()
     ExecuteInGameThread(function()
-        local char = get_character()
+        local char = ue.get_character()
+        if not char then return end
+        local restored = hold.reset(char)
+        state.fine = false
+        hud.clear_warnings()
+        ue.reset_capabilities()
+        toast(restored and string.format("reset — reach back to %.0f cm", restored)
+                        or "reset — nothing to restore")
+    end)
+end
+
+local function act_recalibrate()
+    with_char("calibrate", function(char)
+        hold.state.calibrated = false
+        local s, note = hold.calibrate(char, cfg.calibrate_probe)
+        toast(s and ("calibrated: " .. note) or ("calibration failed: " .. note))
+        log("recalibrate -> %s", note)
+    end)
+end
+
+local function act_probe()
+    ExecuteInGameThread(function()
+        local char = ue.get_character()
         if not char then log("probe: no character"); return end
+        local holding, posing = hold.hold_flags(char)
+        local yaw, pitch, fwd = hold.pose(char)
+        local actor = ue.held_actor(char)
+        local xf = actor and ue.actor_transform(actor)
+        local can_print, can_draw = ue.probe_capabilities()
 
         local out = { "probe:" }
-        local function add(label, getter)
-            local ok, v = pcall(getter)
-            out[#out + 1] = string.format("  %-28s %s", label, ok and tostring(v) or "<unreadable>")
+        local function line(k, v) out[#out + 1] = string.format("  %-26s %s", k, tostring(v)) end
+        line("IsHolding", holding); line("IsHandPosing", posing)
+        line("HandEmoteYaw", yaw); line("HandEmotePitch", pitch); line("HandEmoteFwd", fwd)
+        line("reach", hold.reach(char)); line("reach stock", hold.state.orig_reach)
+        line("sensitivity", hold.state.sens); line("calibration", hold.state.calib_note)
+        line("held actor", actor and actor:GetFullName() or "none")
+        if xf then
+            line("actor location", string.format("X=%.1f Y=%.1f Z=%.1f", xf.loc.X, xf.loc.Y, xf.loc.Z))
+            line("actor rotation", string.format("P=%.2f Y=%.2f R=%.2f", xf.rot.Pitch, xf.rot.Yaw, xf.rot.Roll))
+            line("off level (deg)", string.format("%.2f", mathx.off_level(xf.rot.Pitch, xf.rot.Roll)))
         end
-
-        add("IsHolding",       function() return char.IsHolding end)
-        add("IsHandPosing",    function() return char.IsHandPosing end)
-        add("HandEmoteYaw",    function() return char.HandEmoteYaw end)
-        add("HandEmotePitch",  function() return char.HandEmotePitch end)
-        add("HandEmoteFwd",    function() return char.HandEmoteFwd end)
-        add("HandEmoteRight",  function() return char.HandEmoteRight end)
-        add("HandEmoteLeft",   function() return char.HandEmoteLeft end)
-        add("LookAtDistance",  function() return char.LookAtDistance end)
-        add("Reach(holding)",  function() return char.LookAtDistanceWhenHoldingItem end)
-        out[#out + 1] = string.format("  %-28s %s", "Reach(stock)",
-            state.orig_reach and string.format("%.1f", state.orig_reach) or "<untouched>")
-
-        -- FVector / FRotator (3x double each)
-        local function vec(label, field)
-            local ok, s = pcall(function()
-                local v = char[field]
-                return string.format("X=%.3f Y=%.3f Z=%.3f", v.X, v.Y, v.Z)
-            end)
-            if not ok then
-                ok, s = pcall(function()
-                    local v = char[field]
-                    return string.format("P=%.3f Y=%.3f R=%.3f", v.Pitch, v.Yaw, v.Roll)
-                end)
-            end
-            out[#out + 1] = string.format("  %-28s %s", label, ok and s or "<unreadable>")
-        end
-        vec("HoldTargetLocation", "HoldTransformTargetLocation")
-        vec("HoldTargetRotation", "HoldTransformTargetRotation")
-
-        local ok, held = pcall(function()
-            local a = char.CurrentPickUpActor
-            if a and a:IsValid() then return a:GetFullName() end
-            return "none"
-        end)
-        out[#out + 1] = string.format("  %-28s %s", "CurrentPickUpActor", ok and tostring(held) or "<unreadable>")
-        out[#out + 1] = string.format("  %-28s fine=%s scale=%.3f hooked=%s nudges=%d",
-            "mod", tostring(state.fine), cfg.fine_scale, tostring(state.hooked), state.nudges)
-
+        line("can print to screen", can_print); line("can draw in world", can_draw)
+        line("mod", string.format("fine=%s snap=%s hud=%s guides=%s hooked=%s actions=%d",
+            tostring(state.fine), tostring(state.snap), tostring(state.hud),
+            tostring(state.guides), tostring(state.hooked), hold.state.actions))
         print(TAG .. table.concat(out, "\n") .. "\n")
     end)
 end
 
---------------------------------------------------------------------------------
--- Keybinds
---------------------------------------------------------------------------------
+-- ------------------------------------------------------------------ keybinds
 
-local function toggle_fine()
-    state.fine = not state.fine
-    if state.fine and not state.hooked then install_hook() end
-    log("fine mode %s (scale %.3f)", state.fine and "ON" or "OFF", cfg.fine_scale)
-end
-
--- Bind defensively: UE4SS's Key table varies between builds, so a missing name
--- must not abort the whole mod and silently leave nothing bound.
-local function bind(key_name, fn, desc)
-    local k = Key and Key[key_name]
+local function bind(action, fn, desc)
+    local name = cfg.keys and cfg.keys[action]
+    if not name then
+        log("WARN no key configured for '%s'", action); return false
+    end
+    local k = Key and Key[name]
     if k == nil then
-        log("WARN key '%s' unknown in this UE4SS build — '%s' not bound", key_name, desc)
+        log("WARN key '%s' (for %s) unknown in this UE4SS build — not bound", name, desc or action)
         return false
     end
     local ok, err = pcall(RegisterKeyBind, k, fn)
     if not ok then
-        log("WARN could not bind %s (%s): %s", key_name, desc, tostring(err))
-        return false
+        log("WARN could not bind %s -> %s: %s", name, desc or action, tostring(err)); return false
     end
     return true
 end
 
-local bound = 0
-local function tally(b) if b then bound = bound + 1 end end
+local function tally(b) if b then state.bound = state.bound + 1 end end
 
-tally(bind("F3", toggle_fine,                                        "toggle fine mode"))
-tally(bind("F4", probe,                                              "probe values"))
+tally(bind("fine_toggle", function()
+    state.fine = not state.fine
+    if state.fine and not state.hooked then install_hook() end
+    toast("fine mode %s", state.fine and "ON" or "off")
+end, "fine mode"))
 
--- Numpad: 4/6 yaw, 8/2 pitch, ADD/SUBTRACT push-pull (via the game's replicated axis)
-tally(bind("NUM_FOUR",  function() nudge(-cfg.nudge_yaw, 0, 0) end,  "yaw -"))
-tally(bind("NUM_SIX",   function() nudge( cfg.nudge_yaw, 0, 0) end,  "yaw +"))
-tally(bind("NUM_EIGHT", function() nudge(0,  cfg.nudge_pitch, 0) end,"pitch +"))
-tally(bind("NUM_TWO",   function() nudge(0, -cfg.nudge_pitch, 0) end,"pitch -"))
-tally(bind("ADD",       function() nudge(0, 0,  cfg.nudge_fwd) end,  "push away (fine)"))
-tally(bind("SUBTRACT",  function() nudge(0, 0, -cfg.nudge_fwd) end,  "pull closer (fine)"))
+tally(bind("hud_toggle", function()
+    state.hud = not state.hud
+    hud.clear_warnings()
+    toast("HUD %s", state.hud and "on" or "off")
+end, "HUD"))
 
--- Reach: coarse base distance, far more range than the clamped axis above
-tally(bind("NUM_NINE",  function() reach_adjust( cfg.reach_step) end, "reach further"))
-tally(bind("NUM_THREE", function() reach_adjust(-cfg.reach_step) end, "reach closer"))
-tally(bind("NUM_FIVE",  reach_reset,                                  "restore stock reach"))
+tally(bind("guides_toggle", function()
+    state.guides = not state.guides
+    hud.clear_warnings()
+    toast("guides %s", state.guides and "on" or "off")
+end, "guides"))
 
---------------------------------------------------------------------------------
--- Console: rvfine probe|on|off|scale <f>|step <f>|reach <f>|reachstep <f>|reset|verbose|hook
---------------------------------------------------------------------------------
+tally(bind("snap_toggle", function()
+    state.snap = not state.snap
+    toast("snap %s", state.snap and string.format("ON (%.0f deg)", cfg.snap_deg) or "off")
+end, "snap"))
 
-local function handle_cmd(_, params, out)
+tally(bind("probe",       act_probe,       "probe"))
+tally(bind("recalibrate", act_recalibrate, "recalibrate"))
+tally(bind("zero_pose",   act_zero,        "zero pose"))
+tally(bind("reset_all",   act_reset,       "reset"))
+
+tally(bind("yaw_minus",  function() act_nudge(-cfg.nudge_deg, 0, 0) end, "yaw -"))
+tally(bind("yaw_plus",   function() act_nudge( cfg.nudge_deg, 0, 0) end, "yaw +"))
+tally(bind("pitch_plus", function() act_nudge(0,  cfg.nudge_deg, 0) end, "pitch +"))
+tally(bind("pitch_minus",function() act_nudge(0, -cfg.nudge_deg, 0) end, "pitch -"))
+tally(bind("push",       function() act_nudge(0, 0,  cfg.nudge_cm) end,  "push"))
+tally(bind("pull",       function() act_nudge(0, 0, -cfg.nudge_cm) end,  "pull"))
+
+tally(bind("reach_out",  function() act_reach( cfg.reach_step) end, "reach out"))
+tally(bind("reach_in",   function() act_reach(-cfg.reach_step) end, "reach in"))
+
+-- ------------------------------------------------------------------- console
+
+local function handle_cmd(_, params)
     local sub = (params and params[1] or "probe"):lower()
     local arg = tonumber(params and params[2])
 
-    if sub == "probe" then
-        probe()
-    elseif sub == "on" or sub == "off" then
-        state.fine = (sub == "on")
-        if state.fine and not state.hooked then install_hook() end
-        log("fine mode %s", sub:upper())
-    elseif sub == "scale" and arg then
-        cfg.fine_scale = arg
-        log("fine_scale = %.4f", arg)
-    elseif sub == "step" and arg then
-        cfg.nudge_yaw, cfg.nudge_pitch, cfg.nudge_fwd = arg, arg, arg
-        log("nudge step = %.4f on all axes", arg)
+    if     sub == "probe"  then act_probe()
+    elseif sub == "on"     then state.fine = true;  install_hook(); toast("fine mode ON")
+    elseif sub == "off"    then state.fine = false; toast("fine mode off")
+    elseif sub == "scale" and arg then cfg.fine_scale = arg; log("fine_scale = %.4f", arg)
+    elseif sub == "deg"   and arg then cfg.nudge_deg  = arg; log("nudge_deg = %.3f", arg)
+    elseif sub == "cm"    and arg then cfg.nudge_cm   = arg; log("nudge_cm = %.3f", arg)
+    elseif sub == "snap"  then
+        if arg then cfg.snap_deg = arg end
+        state.snap = true; toast("snap ON (%.0f deg)", cfg.snap_deg)
+    elseif sub == "nosnap" then state.snap = false; toast("snap off")
+    elseif sub == "zero"   then act_zero()
+    elseif sub == "level"  then act_snap_now()
+    elseif sub == "hud"    then state.hud = not state.hud; hud.clear_warnings(); toast("HUD %s", tostring(state.hud))
+    elseif sub == "guides" then state.guides = not state.guides; hud.clear_warnings(); toast("guides %s", tostring(state.guides))
     elseif sub == "reach" and arg then
-        -- absolute target: compute the delta from current
         ExecuteInGameThread(function()
-            local char = get_character()
-            local cur = char and read_reach(char)
-            if cur then reach_adjust(arg - cur) else log("reach: unreadable") end
+            local char = ue.get_character()
+            local cur = char and hold.reach(char)
+            if cur then act_reach(arg - cur) else toast("reach unreadable") end
         end)
-    elseif sub == "reachstep" and arg then
-        cfg.reach_step = arg
-        log("reach_step = %.2f cm", arg)
-    elseif sub == "reset" then
-        reach_reset()
-    elseif sub == "verbose" then
-        cfg.verbose = not cfg.verbose
-        log("verbose = %s", tostring(cfg.verbose))
-    elseif sub == "hook" then
-        state.hooked = false
-        install_hook()
+    elseif sub == "reachstep" and arg then cfg.reach_step = arg; log("reach_step = %.2f", arg)
+    elseif sub == "calibrate" then act_recalibrate()
+    elseif sub == "reset"     then act_reset()
+    elseif sub == "verbose"   then cfg.verbose = not cfg.verbose; log("verbose = %s", tostring(cfg.verbose))
+    elseif sub == "hook"      then state.hooked = false; install_hook()
     else
-        log("usage: rvfine [probe|on|off|scale <f>|step <f>|reach <cm>|reachstep <cm>|reset|verbose|hook]")
+        log("usage: rvfine [probe|on|off|scale f|deg f|cm f|snap [f]|nosnap|zero|level|" ..
+            "hud|guides|reach cm|reachstep cm|calibrate|reset|verbose|hook]")
     end
     return true
 end
 
 pcall(RegisterConsoleCommandHandler, "rvfine", handle_cmd)
 
---------------------------------------------------------------------------------
--- Boot: install the hook once a character exists. NotifyOnNewObject fires on
--- spawn; we also retry on a timer because load order is not guaranteed.
---------------------------------------------------------------------------------
+-- --------------------------------------------------------------- feedback loop
+
+local function feedback_tick()
+    if not (state.hud or state.guides) then return end
+    ExecuteInGameThread(function()
+        local char = ue.get_character()
+        if not char then return end
+        local holding, posing = hold.hold_flags(char)
+        local actor = holding and ue.held_actor(char) or nil
+
+        if state.hud then
+            local yaw, pitch, fwd = hold.pose(char)
+            local off
+            if actor then
+                local xf = ue.actor_transform(actor)
+                if xf then off = mathx.off_level(xf.rot.Pitch, xf.rot.Roll) end
+            end
+            hud.show({
+                holding = holding, posing = posing,
+                fine = state.fine, snap = state.snap,
+                yaw = yaw, pitch = pitch, fwd = fwd,
+                reach = hold.reach(char), orig_reach = hold.state.orig_reach,
+                off_level = off,
+                sens = hold.state.sens, calib_note = hold.state.calib_note,
+            }, cfg)
+        end
+
+        if state.guides and actor then
+            hud.draw_guides(actor, cfg)
+        end
+    end)
+end
+
+-- --------------------------------------------------------------------- boot
 
 pcall(function()
     NotifyOnNewObject("/Script/Engine.PlayerController", function()
-        if not state.hooked then
-            ExecuteWithDelay(2000, function() install_hook() end)
-        end
+        if not state.hooked then ExecuteWithDelay(2000, install_hook) end
     end)
 end)
 
 pcall(function()
     LoopAsync(5000, function()
         if not state.hooked then install_hook() end
-        return state.hooked -- returning true stops the loop
+        return state.hooked
     end)
 end)
 
-log("v%s loaded — %d keybinds bound. F3 fine mode, F4 probe, numpad to nudge, `rvfine` in console.",
-    VERSION, bound)
+pcall(function()
+    LoopAsync(math.max(33, math.floor((cfg.hud_interval or 0.1) * 1000)), function()
+        feedback_tick()
+        return false   -- run forever
+    end)
+end)
+
+log("v%s loaded — %d keybinds bound. %s/%s yaw, %s/%s pitch, %s fine, %s HUD, `rvfine` in console.",
+    VERSION, state.bound,
+    cfg.keys.yaw_minus, cfg.keys.yaw_plus, cfg.keys.pitch_minus, cfg.keys.pitch_plus,
+    cfg.keys.fine_toggle, cfg.keys.hud_toggle)
+
+-- exported for the test suite
+return {
+    _state = state, _cfg = cfg, _install_hook = install_hook,
+    _feedback_tick = feedback_tick, _handle_cmd = handle_cmd,
+    _actions = { nudge = act_nudge, snap = act_snap_now, zero = act_zero,
+                 reach = act_reach, reset = act_reset, probe = act_probe,
+                 recalibrate = act_recalibrate },
+}
